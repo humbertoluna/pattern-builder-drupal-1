@@ -1,0 +1,2063 @@
+<?php
+
+/**
+ * @file
+ * Module for loading and parsing json schema files.
+ */
+
+// Constants.
+define('PATTERNBUILDER_PROPERTY_PREFIX_TUPLE_ITEM', 'pb_tuple_item');
+define('PATTERNBUILDER_PROPERTY_DELIMITER', '::');
+define('PATTERNBUILDER_PROPERTY_MAP_RENDERED_NAME', 'pb_rendered');
+define('PATTERNBUILDER_PROPERTY_MAP_ITEM_DELIMITER', ',');
+define('PATTERNBUILDER_PROPERTY_MAP_VALUE_DELIMITER', '=');
+define('PATTERNBUILDER_PROPERTY_MAP_CHAIN_DELIMITER', ':');
+
+/**
+ * Implements hook_hook_info().
+ */
+function patternbuilder_hook_info() {
+  $base_info = array('group' => 'patternbuilder');
+
+  return array(
+    'patternbuilder_pattern_types' => $base_info,
+    'patternbuilder_pattern_types_alter' => $base_info,
+    'patternbuilder_pattern_status_info' => $base_info,
+    'patternbuilder_pattern_status_info_alter' => $base_info,
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function patternbuilder_menu() {
+  $items = array();
+
+  // Admin config page.
+  $items['admin/config/content/patternbuilder'] = array(
+    'title' => 'Pattern Builder',
+    'description' => 'Settings for the patternbuilder module.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('patternbuilder_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'patternbuilder.admin.inc',
+    'weight' => -100,
+  );
+
+  // Paragraph pattern info.
+  $items['admin/structure/paragraphs/%paragraphs_bundle/patternbuilder'] = array(
+    'title' => 'Pattern',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('patternbuilder_admin_bundle_form', 3),
+    'access callback' => 'patternbuilder_admin_bundle_form_access',
+    'access arguments' => array(3),
+    'file' => 'patternbuilder.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+    'weight' => 10,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function patternbuilder_menu_alter(&$items) {
+  // Override paragaphs bundle list to add "Pattern" link.
+  if (isset($items['admin/structure/paragraphs'])) {
+    $items['admin/structure/paragraphs']['page callback'] = 'patternbuilder_paragraphs_admin_bundle_overview';
+    $items['admin/structure/paragraphs']['file'] = 'patternbuilder.admin.inc';
+    $items['admin/structure/paragraphs']['file path'] = drupal_get_path('module', 'patternbuilder');
+  }
+}
+
+/**
+ * Access callback for patternbuilder_admin_bundle_form.
+ *
+ * @param object $bundle
+ *   The paragraph bundle object.
+ */
+function patternbuilder_admin_bundle_form_access($bundle) {
+  return !empty($bundle->bundle) && user_access('administer paragraphs bundles') &&
+    patternbuilder_get_bundle_component($bundle->bundle);
+}
+
+/**
+ * Implements hook_libraries_info().
+ */
+function patternbuilder_libraries_info() {
+  $libraries = array();
+  $libraries['patternbuilder'] = array(
+    // Only used in administrative UI of Libraries API.
+    'title' => t('PatternBuilder'),
+    'vendor url' => 'https://github.com/PatternBuilder/pattern-builder-lib-php',
+    'download url' => 'https://github.com/PatternBuilder/pattern-builder-lib-php',
+    'path' => 'vendor',
+    'version' => 'v1.0.0',
+    'files' => array(
+      'php' => array(
+        'autoload.php',
+      ),
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function patternbuilder_views_api() {
+  return array(
+    'api' => '3.0',
+    'path' => drupal_get_path('module', 'patternbuilder') . '/views',
+  );
+}
+
+/**
+ * Invalidate all patternbuilder cache, forcing a rebuild on the next grab.
+ */
+function patternbuilder_invalidate_cache() {
+  // Fully built schemas could reference a schema that has changed so all
+  // cached schema objects must be purged.
+  $controller = patternbuilder_get();
+  $controller->clearAllCache();
+
+  drupal_static_reset('patternbuilder_get_schemas');
+  cache_clear_all('patternbuilder_schema_paths', 'cache');
+
+  drupal_static_reset('patternbuilder_get_template_paths');
+
+  drupal_static_reset('patternbuilder_get_pattern_types');
+  cache_clear_all('patternbuilder_drupal:pattern_types', 'cache');
+
+  patternbuilder_pattern_statuses_reset();
+
+  drupal_static_reset('patternbuilder_components_load');
+  drupal_static_reset('patternbuilder_components_load__bundles');
+
+  drupal_static_reset('patternbuilder_get_resolver');
+}
+
+/**
+ * Returns the machine name for a schema name.
+ *
+ * @param string $name
+ *   A schema machine name or file name.
+ *
+ * @return string
+ *   Machine name.
+ */
+function patternbuilder_clean_schema_machine_name($name) {
+  if (strpos($name, '.') !== FALSE) {
+    $name = basename($name, '.json');
+  }
+
+  // Replace hyphen with underscore, @see paragraphs_bundle_load().
+  return strtr($name, array('-' => '_'));
+}
+
+/**
+ * Resolves a file path to be used for schemas or templates.
+ *
+ * @param string $path
+ *   The file path.
+ *
+ * @return string
+ *   The resolved file path.
+ */
+function patternbuilder_resolve_file_path($path) {
+  if (strpos($path, '/') === 0) {
+    // Set path as root file path.
+    $file_path = 'file://' . $path;
+  }
+  elseif (file_uri_scheme($path)) {
+    // Set path as URI.
+    $file_path = $path;
+  }
+  else {
+    // Assume relative to the Drupal root.
+    $file_path = 'file://' . DRUPAL_ROOT . '/' . trim($path, '/');
+  }
+
+  return $file_path;
+}
+
+/**
+ * Get a list of all schema files.
+ *
+ * @param bool $rebuild
+ *   TRUE to rebuild the schema cache.
+ *
+ * @return array
+ *   All available schema files, keyed by the schema name.
+ */
+function patternbuilder_get_schemas($rebuild = FALSE) {
+  $schemas = &drupal_static(__FUNCTION__);
+
+  // Cache check.
+  if (isset($schemas) && !$rebuild) {
+    if (!empty($schemas)) {
+      return $schemas;
+    }
+    elseif ($cached_schemas = cache_get('patternbuilder_schema_paths')) {
+      $schemas = $cached_schemas->data;
+      return $schemas;
+    }
+  }
+
+  // Build cache.
+  $schemas = array();
+  $schema_dirs = variable_get('patternbuilder_schema_dirs', array());
+
+  // Set to a consistent empty value.
+  if (!empty($schema_dirs)) {
+    // Scan directories.
+    foreach ($schema_dirs as $schema_dir) {
+      $files = file_scan_directory($schema_dir, '/\.json$/');
+      foreach ($files as $file) {
+        $machine_name = patternbuilder_clean_schema_machine_name($file->name);
+        if (!isset($schemas[$machine_name])) {
+          // Store resolved path.
+          $schemas[$machine_name] = patternbuilder_resolve_file_path($file->uri);
+        }
+        else {
+          // Log duplicates.
+          watchdog('patternbuilder', 'Duplicate schemas found for "@name" at "@path". The first schema registered will be used until this conflict has been resolved. Active schema: "@existing"', array(
+            '@name' => $machine_name,
+            '@path' => $file->uri,
+            '@existing' => $schemas[$machine_name],
+          ), WATCHDOG_WARNING);
+        }
+      }
+    }
+  }
+
+  // Store both non-empty and empty so not constantly rebuild for empty.
+  cache_set('patternbuilder_schema_paths', $schemas);
+  return $schemas;
+}
+
+/**
+ * Add a schema directory.
+ *
+ * @param array|string $dirs
+ *   An array of directories or a single directory.
+ */
+function patternbuilder_schema_dirs_add($dirs) {
+  $stored = variable_get('patternbuilder_schema_dirs', array());
+
+  if (!is_array($dirs)) {
+    $dirs = array($dirs);
+  }
+  $new_dirs = array_diff($dirs, $stored);
+  if ($new_dirs) {
+    $stored = array_merge($stored, $new_dirs);
+    variable_set('patternbuilder_schema_dirs', $stored);
+    patternbuilder_get_schemas(TRUE);
+  }
+}
+
+/**
+ * Remove a schema directory.
+ *
+ * @param array|string $dirs
+ *   An array of directories or a single directory.
+ */
+function patternbuilder_schema_dirs_remove($dirs) {
+  $stored = variable_get('patternbuilder_schema_dirs', array());
+  if ($stored) {
+    if (!is_array($dirs)) {
+      $dirs = array($dirs);
+    }
+
+    $stored = array_diff($stored, $dirs);
+    variable_set('patternbuilder_schema_dirs', $stored);
+    patternbuilder_get_schemas(TRUE);
+  }
+}
+
+/**
+ * Get a list of all template paths.
+ *
+ * @param bool $rebuild
+ *   TRUE to rebuild the cache.
+ *
+ * @return array
+ *   All available template paths.
+ */
+function patternbuilder_get_template_paths($rebuild = FALSE) {
+  $cache = &drupal_static(__FUNCTION__);
+  if ($rebuild || !isset($cache)) {
+    $dirs = variable_get('patternbuilder_template_dirs', array());
+    if (!empty($dirs)) {
+      foreach ($dirs as &$dir) {
+        if (strpos($dir, '/') !== 0 && !file_uri_scheme($dir)) {
+          // Assume relative to the Drupal root.
+          $dir = DRUPAL_ROOT . '/' . trim($dir, '/');
+        }
+      }
+      unset($dir);
+    }
+    else {
+      $dirs = array();
+    }
+
+    $cache = $dirs;
+  }
+
+  return $cache;
+}
+
+/**
+ * Add a template directory.
+ *
+ * @param array|string $dirs
+ *   An array of directories or a single directory.
+ */
+function patternbuilder_template_dirs_add($dirs) {
+  $stored = variable_get('patternbuilder_template_dirs', array());
+
+  if (!is_array($dirs)) {
+    $dirs = array($dirs);
+  }
+  $new_dirs = array_diff($dirs, $stored);
+  if ($new_dirs) {
+    $stored = array_merge($stored, $new_dirs);
+    variable_set('patternbuilder_template_dirs', $stored);
+  }
+}
+
+/**
+ * Remove a template directory.
+ *
+ * @param array|string $dirs
+ *   An array of directories or a single directory.
+ */
+function patternbuilder_template_dirs_remove($dirs) {
+  $stored = variable_get('patternbuilder_template_dirs', array());
+  if ($stored) {
+    if (!is_array($dirs)) {
+      $dirs = array($dirs);
+    }
+
+    $stored = array_diff($stored, $dirs);
+    variable_set('patternbuilder_template_dirs', $stored);
+  }
+}
+
+/**
+ * Return an instance of the patternbuilder factory class.
+ *
+ * @param array $twig_arguments
+ *   An array of twig environment variables.
+ *
+ * @return DrupalPatternBuilderSchema
+ *   A drupal schema factory object.
+ */
+function patternbuilder_get($twig_arguments = array()) {
+  patternbuilder_init_libraries();
+  $template_paths = patternbuilder_get_template_paths();
+  $loader = new Twig_Loader_Filesystem($template_paths);
+  $twig = new Twig_Environment($loader, $twig_arguments);
+  $logger = new DrupalPatternBuilderLog();
+  $retriever = new JsonSchema\Uri\UriRetriever();
+  $resolver = new DrupalPatternBuilderRefResolver($retriever, 30);
+  $configuration = new PatternBuilder\Configuration\Configuration($logger, $twig, $resolver);
+  // TODO: schema object cache disabled until can effectively cache without
+  // object / TWIG corruption on loading multiple of the same schema type.
+  // See US83433, US70858.
+  $cache_enabled = FALSE;
+  return new DrupalPatternBuilderSchema($configuration, array(), $cache_enabled);
+}
+
+/**
+ * Return an instance of the JSON resolver class.
+ *
+ * @return DrupalPatternBuilderRefResolver
+ *   A reference resolver.
+ */
+function patternbuilder_get_resolver() {
+  $resolver = &drupal_static(__FUNCTION__);
+  if (!isset($resolver)) {
+    patternbuilder_init_libraries();
+    $retriever = new JsonSchema\Uri\UriRetriever();
+    $resolver = new DrupalPatternBuilderRefResolver($retriever, 30);
+  }
+
+  return $resolver;
+}
+
+/**
+ * Resolve a JSON schema object.
+ *
+ * @param object $schema
+ *   The schema object to resolve.
+ *
+ * @return object
+ *   The resolved schema object.
+ *   Note: The $schema object is altered by reference.
+ */
+function patternbuilder_resolve_schema(&$schema) {
+  if (isset($schema->{'$ref'})) {
+    if (preg_match('@\.json$@', $schema->{'$ref'})) {
+      $ref_name = basename($schema->{'$ref'}, '.json');
+      if ($ref_name) {
+        $schema_paths = patternbuilder_get_schemas();
+        if (isset($schema_paths[$ref_name])) {
+          $ref_original = $schema->{'$ref'};
+          $resolver = patternbuilder_get_resolver();
+          $resolver->resolve($schema, $schema_paths[$ref_name]);
+
+          // Cleanup $ref if not removed by resolver.
+          if (isset($schema->{'$ref'}) && $schema->{'$ref'} == $ref_original) {
+            unset($schema->{'$ref'});
+          }
+        }
+      }
+    }
+  }
+
+  return $schema;
+}
+
+/**
+ * Initializes twig and patternbuilder composer libraries.
+ */
+function patternbuilder_init_libraries() {
+  libraries_load('patternbuilder');
+}
+
+/**
+ * Returns the default pattern type used for un-claimed schemas.
+ *
+ * @return string
+ *   The default pattern type.
+ */
+function patternbuilder_default_pattern_type() {
+  return variable_get('patternbuilder_default_pattern_type', 'pb_default');
+}
+
+/**
+ * Retrieve information for pattern types.
+ *
+ * @param string $pattern_type_name
+ *   The pattern type machine name. If not provided, then all pattern types
+ *   are returned.
+ * @param bool $rebuild
+ *   TRUE to rebuild the cache.
+ *
+ * @return array
+ *   An array of information for the given pattern type. If none provided, then
+ *   all pattern types are returned keyed by the pattern type machine name.
+ */
+function patternbuilder_get_pattern_types($pattern_type_name = NULL, $rebuild = FALSE) {
+  $cache = &drupal_static(__FUNCTION__);
+
+  if (!isset($cache) || $rebuild) {
+    $cid = 'patternbuilder_drupal:pattern_types';
+    if (!$rebuild && ($stored_cache = cache_get($cid))) {
+      $cache = $stored_cache->data;
+    }
+    else {
+      $cache = array();
+
+      if ($rebuild) {
+        // Rebuild module hook cache.
+        module_implements('patternbuilder_pattern_types', FALSE, TRUE);
+        module_implements('patternbuilder_pattern_types_alter', FALSE, TRUE);
+      }
+
+      // Build pattern type cache.
+      $max_weight = 0;
+      foreach (module_implements('patternbuilder_pattern_types') as $module) {
+        foreach (module_invoke($module, 'patternbuilder_pattern_types') as $type_name => $pattern_type_info) {
+          $cache[$type_name] = $pattern_type_info;
+          $cache[$type_name]['name'] = $type_name;
+          $cache[$type_name]['module'] = $module;
+
+          // Set defaults.
+          $cache[$type_name] += array(
+            'weight' => 0,
+            'prefix' => 'pbi',
+            'resolve' => FALSE,
+            'field' => FALSE,
+          );
+
+          // Set default weight.
+          if (!isset($cache[$type_name]['weight'])) {
+            $cache[$type_name]['weight'] = 0;
+          }
+          elseif ($cache[$type_name]['weight'] > $max_weight) {
+            $max_weight = $cache[$type_name]['weight'];
+          }
+
+          // Field based schemas must be resolved.
+          if ($cache[$type_name]['field']) {
+            $cache[$type_name]['resolve'] = TRUE;
+          }
+        }
+      }
+
+      // Set default type if not defined.
+      $default_type = patternbuilder_default_pattern_type();
+      if ($default_type && !isset($cache[$default_type])) {
+        // This is weighted heavy to allow all other types to claim a schema
+        // during import.
+        $cache[$default_type] = array(
+          'name' => 'pb_default',
+          'label' => 'Default',
+          'module' => 'patternbuilder',
+          'prefix' => 'pbi',
+          'resolve' => FALSE,
+          'field' => FALSE,
+          'weight' => $max_weight + 100,
+        );
+      }
+
+      drupal_alter('patternbuilder_pattern_types', $cache);
+      uasort($cache, 'drupal_sort_weight');
+      cache_set($cid, $cache);
+    }
+  }
+
+  // Single type return.
+  if (isset($pattern_type_name)) {
+    return isset($cache[$pattern_type_name]) ? $cache[$pattern_type_name] : array();
+  }
+
+  // Return all types.
+  return $cache;
+}
+
+/**
+ * Returns a list of pattern type labels.
+ *
+ * @param string $name
+ *   Optional parameter specifying the name of the pattern status whose title
+ *   to return.
+ *
+ * @return array|string
+ *   An array keyed by pattern type machine name with labels as values or a
+ *   single label if the name is provided.
+ */
+function patternbuilder_pattern_types_labels($name = NULL) {
+  $labels = array();
+  $types = patternbuilder_get_pattern_types();
+
+  // Return a status title if specified and it exists.
+  if (!empty($name)) {
+    return isset($types[$name]['label']) ? $types[$name]['label'] : NULL;
+  }
+
+  // Return all.
+  if ($types) {
+    foreach ($types as $name => $info) {
+      $label = isset($info['label']) ? $info['label'] : $name;
+      $labels[$name] = $label;
+    }
+  }
+
+  return $labels;
+}
+
+/**
+ * Returns an option list suitable for an HTML element.
+ */
+function patternbuilder_pattern_types_options_list() {
+  $options = array();
+  $labels = patternbuilder_pattern_types_labels();
+  if ($labels) {
+    $options = array_map('check_plain', $labels);
+  }
+
+  return $options;
+}
+
+/**
+ * Returns a list of paragraph bundle labels.
+ *
+ * @return array
+ *   An array keyed by bundle machine name with labels as values.
+ */
+function patternbuilder_paragraph_bundle_labels() {
+  $labels = array();
+  $bundles = paragraphs_bundle_load();
+
+  foreach ($bundles as $name => $bundle) {
+    $labels[$name] = !empty($bundle->name) ? $bundle->name : $name;
+  }
+  return $labels;
+}
+
+/**
+ * Loads all component IDs from memory.
+ *
+ * @return array
+ *   All components by machine name => id
+ */
+function _patternbuilder_component_ids_load() {
+  return db_select('patternbuilder_components', 'c')
+    ->fields('c', array('machine_name', 'id'))
+    ->orderBy('c.id', 'ASC')
+    ->execute()
+    ->fetchAllKeyed();
+}
+
+/**
+ * Load stored pattern components.
+ *
+ * @param string|null $machine_name
+ *   The component machine name or NULL to load all.
+ * @param bool $rebuild
+ *   TRUE to rebuild the cache.
+ *
+ * @return array|object|null
+ *   The component object if $machine_name is provided, else all components
+ *   keyed by machine name.
+ */
+function patternbuilder_components_load($machine_name = NULL, $rebuild = FALSE) {
+  $cache = &drupal_static(__FUNCTION__);
+  $bundle_cache = &drupal_static(__FUNCTION__ . '__bundles');
+
+  if ($rebuild || !isset($cache)) {
+    $cache = array();
+    $bundle_cache = array();
+    $records = db_select('patternbuilder_components', 'c')
+      ->fields('c')
+      ->orderBy('c.id', 'ASC')
+      ->execute()
+      ->fetchAllAssoc('machine_name');
+
+    if ($records) {
+      // Set default status.
+      $default_status = patternbuilder_pattern_status_default();
+      $default_status_name = isset($default_status['name']) ? $default_status['name'] : NULL;
+      foreach ($records as $k => $record) {
+        if (empty($record->status)) {
+          $record->status = $default_status_name;
+        }
+
+        // Build component cache.
+        $cache[$k] = $record;
+
+        // Build bundle cache.
+        if (!empty($record->bundle_name) && !isset($bundle_cache[$record->bundle_name])) {
+          $bundle_cache[$record->bundle_name] = &$cache[$k];
+        }
+      }
+    }
+  }
+
+  if (!empty($machine_name)) {
+    return isset($cache[$machine_name]) ? $cache[$machine_name] : NULL;
+  }
+
+  return $cache;
+}
+
+/**
+ * Returns the pattern component for all bundles.
+ *
+ * @return array
+ *   An array of pattern component objects keyed by bundle name.
+ */
+function patternbuilder_get_bundle_component_map() {
+  patternbuilder_components_load();
+  $bundle_components = drupal_static('patternbuilder_components_load__bundles', array());
+  return $bundle_components ? $bundle_components : array();
+}
+
+/**
+ * Returns the pattern component for a given bundle.
+ *
+ * @param string $bundle_name
+ *   The bundle name.
+ *
+ * @return object|null
+ *   The pattern component object corresponding to the bundle.
+ */
+function patternbuilder_get_bundle_component($bundle_name) {
+  $bundle_components = patternbuilder_get_bundle_component_map();
+  return isset($bundle_components[$bundle_name]) ? $bundle_components[$bundle_name] : NULL;
+}
+
+/**
+ * Returns a map of pattern type to bundles.
+ *
+ * @param string|null $pattern_type_name
+ *   The component pattern type or NULL to load all pattern types.
+ * @param bool $rebuild
+ *   TRUE to rebuild the cache.
+ *
+ * @return array
+ *   An array with keys of pattern type and values of an array of bundle names
+ *   keyed by machine name.
+ */
+function patternbuilder_components_get_pattern_type_bundles($pattern_type_name = NULL, $rebuild = FALSE) {
+  $return = array();
+  $components = patternbuilder_components_load(NULL, $rebuild);
+
+  if (!empty($pattern_type_name)) {
+    foreach ($components as $machine_name => $component) {
+      if (!empty($component->bundle_name) && !empty($component->pattern_type) && $component->pattern_type == $pattern_type_name) {
+        $return[$machine_name] = $component->bundle_name;
+      }
+    }
+
+    asort($return);
+  }
+  else {
+    foreach ($components as $machine_name => $component) {
+      if (!empty($component->bundle_name)) {
+        $pattern_type_key = !empty($component->pattern_type) ? $component->pattern_type : '';
+        $return[$pattern_type_key][$machine_name] = $component->bundle_name;
+      }
+    }
+
+    foreach ($return as $pattern_type_key => &$pattern_type_components) {
+      asort($pattern_type_components);
+    }
+    unset($pattern_type_components);
+  }
+
+  return $return;
+}
+
+/**
+ * Determine if the component is imported.
+ *
+ * @param object|string $component
+ *   The component object or machine name.
+ *
+ * @return bool
+ *   TRUE if the component is a resolved schema.
+ */
+function patternbuilder_component_is_imported($component) {
+  if (is_string($component)) {
+    $component = patternbuilder_components_load($component);
+  }
+
+  if (!empty($component->status)) {
+    $statuses = patternbuilder_pattern_statuses(array(
+      'import' => TRUE,
+    ));
+    return isset($statuses[$component->status]);
+  }
+
+  return TRUE;
+}
+
+/**
+ * Determine if the component is creatable.
+ *
+ * @param object|string $component
+ *   The component object or machine name.
+ *
+ * @return bool
+ *   TRUE if the component is a resolved schema.
+ */
+function patternbuilder_component_is_creatable($component) {
+  if (is_string($component)) {
+    $component = patternbuilder_components_load($component);
+  }
+
+  if (!empty($component->status)) {
+    $statuses = patternbuilder_pattern_statuses(array(
+      'creatable' => TRUE,
+    ));
+    return isset($statuses[$component->status]);
+  }
+
+  return TRUE;
+}
+
+/**
+ * Determine if the component is visible in the widget.
+ *
+ * @param object|string $component
+ *   The component object or machine name.
+ *
+ * @return bool
+ *   TRUE if the component is a resolved schema.
+ */
+function patternbuilder_component_is_widget_visible($component) {
+  if (is_string($component)) {
+    $component = patternbuilder_components_load($component);
+  }
+
+  if (!empty($component->status)) {
+    $statuses = patternbuilder_pattern_statuses(array(
+      'visible' => TRUE,
+    ));
+    return isset($statuses[$component->status]);
+  }
+
+  return TRUE;
+}
+
+/**
+ * Determine if the component is resolved.
+ *
+ * @param object|string $component
+ *   The component object or machine name.
+ *
+ * @return bool
+ *   TRUE if the component is a resolved schema.
+ */
+function patternbuilder_component_is_resolved($component) {
+  if (is_string($component)) {
+    $component = patternbuilder_components_load($component);
+  }
+
+  if (isset($component->pattern_type) && $component->pattern_type) {
+    $type_info = patternbuilder_get_pattern_types($component->pattern_type);
+    return !empty($type_info['resolve']);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Determine if the component is a field based schema.
+ *
+ * @param object|string $component
+ *   The component object or machine name.
+ *
+ * @return bool
+ *   TRUE if the component is a field.
+ */
+function patternbuilder_component_is_field($component) {
+  if (is_string($component)) {
+    $component = patternbuilder_components_load($component);
+  }
+
+  if (isset($component->pattern_type) && $component->pattern_type) {
+    $type_info = patternbuilder_get_pattern_types($component->pattern_type);
+    return !empty($type_info['field']);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Returns the pattern component for a given field name.
+ *
+ * @param string $field_name
+ *   The field name.
+ *
+ * @return object|null
+ *   The pattern component object corresponding to the bundle.
+ */
+function patternbuilder_get_field_component($field_name) {
+  $components = patternbuilder_components_load();
+  foreach ($components as $machine_name => $component) {
+    if (!empty($component->field_name) && $component->field_name == $field_name) {
+      return $component;
+    }
+  }
+}
+
+/**
+ * Adds a unique machine name to the component table.
+ *
+ * @param array|object $component
+ *   The component object or array with the following values:
+ *   - machine_name: The machine name to create or update.
+ *   - pattern_type: The pattern type machine name.
+ *   - bundle_name: The paragraph bundle name.
+ *   - field_name: The field name (if a non bundle component).
+ *   - status: The pattern status name.
+ *
+ * @return object|null
+ *   The fully loaded saved component object. NULL is returned if the component
+ *   cannot be saved.
+ *
+ * @throws \Exception
+ *   General error.
+ */
+function patternbuilder_component_save(&$component) {
+  $record = (array) $component;
+
+  if (empty($record['machine_name'])) {
+    return NULL;
+  }
+
+  $current_component = patternbuilder_components_load($record['machine_name']);
+
+  if (empty($record['pattern_type'])) {
+    $record['pattern_type'] = patternbuilder_default_pattern_type();
+  }
+
+  if (empty($record['status']) && empty($current_component)) {
+    $default_status = patternbuilder_pattern_status_default();
+    $default_status_key = isset($default_status['name']) ? $default_status['name'] : NULL;
+    $record['status'] = $default_status_key;
+  }
+
+  // Ensure only allowed fields to update.
+  $record = array_intersect_key($record, array(
+    'machine_name' => 1,
+    'pattern_type' => 1,
+    'status' => 1,
+    'bundle_name' => 1,
+    'field_name' => 1,
+  ));
+
+  // Update record.
+  db_merge('patternbuilder_components')
+    ->key(array('machine_name' => $record['machine_name']))
+    ->fields($record)
+    ->execute();
+
+  // Rebuild load cache and return the component.
+  $updated_component = patternbuilder_components_load($record['machine_name'], TRUE);
+
+  // Update referenced component.
+  if (is_object($component)) {
+    foreach ($updated_component as $property => $property_value) {
+      $component->{$property} = $property_value;
+    }
+  }
+  elseif (is_array($component)) {
+    foreach ($updated_component as $property => $property_value) {
+      $component[$property] = $property_value;
+    }
+  }
+
+  return $updated_component;
+}
+
+/**
+ * Returns an array of some or all of the order statuses keyed by name.
+ *
+ * @param array $conditions
+ *   An array of conditions to filter the returned list by; for example, if you
+ *   specify 'import' => TRUE in the array, then only statuses that can be
+ *   imported will be returned.
+ * @param bool $rebuild
+ *   TRUE to rebuild the cache.
+ *
+ * @return array
+ *   The array of status info, keyed by status name.
+ */
+function patternbuilder_pattern_statuses($conditions = array(), $rebuild = FALSE) {
+  $statuses = &drupal_static(__FUNCTION__);
+
+  if (!isset($statuses) || $rebuild) {
+    $cid = 'patternbuilder_drupal:pattern_status_info';
+    if (!$rebuild && ($cache = cache_get($cid))) {
+      $statuses = $cache->data;
+    }
+    else {
+      // Build via module hooks.
+      if ($rebuild) {
+        // Rebuild module hook cache.
+        module_implements('patternbuilder_pattern_status_info', FALSE, TRUE);
+        module_implements('patternbuilder_pattern_status_info_alter', FALSE, TRUE);
+      }
+
+      // Process each module.
+      $statuses = array();
+      foreach (module_implements('patternbuilder_pattern_status_info') as $module) {
+        foreach (module_invoke($module, 'patternbuilder_pattern_status_info') as $name => $status) {
+          // Only allow valid status names.
+          if (drupal_strlen($name) <= 32) {
+            $statuses[$name] = $status;
+            $statuses[$name]['module'] = $module;
+
+            // Set defaults.
+            $statuses[$name] += array(
+              'name' => $name,
+              'label' => $name,
+              'weight' => 0,
+              'import' => TRUE,
+              'visible' => TRUE,
+              'creatable' => TRUE,
+            );
+          }
+        }
+      }
+    }
+
+    // Give other modules a chance to alter the order statuses.
+    drupal_alter('patternbuilder_pattern_status_info', $statuses);
+
+    uasort($statuses, 'drupal_sort_weight');
+    cache_set($cid, $statuses);
+  }
+
+  // Apply conditions to the returned statuses if specified.
+  if (!empty($conditions)) {
+    $matching_statuses = array();
+
+    foreach ($statuses as $name => $status) {
+      // Check the status against the conditions array to determine whether to
+      // add it to the return array or not.
+      $valid = TRUE;
+
+      foreach ($conditions as $property => $value) {
+        // If the current value for the specified property on the status does
+        // not match the filter value...
+        if ($status[$property] != $value) {
+          // Do not add it to the temporary array.
+          $valid = FALSE;
+        }
+      }
+
+      if ($valid) {
+        $matching_statuses[$name] = $status;
+      }
+    }
+
+    return $matching_statuses;
+  }
+
+  return $statuses;
+}
+
+/**
+ * Resets the cached list of pattern statuses.
+ */
+function patternbuilder_pattern_statuses_reset() {
+  drupal_static_reset('patternbuilder_pattern_statuses');
+  cache_clear_all('patternbuilder_drupal:pattern_statuses', 'cache');
+}
+
+/**
+ * Returns info for a pattern status.
+ *
+ * @param string $name
+ *   The machine readable name string of the status to return.
+ *
+ * @return array|null
+ *   The fully loaded status information or NULL if not found.
+ */
+function patternbuilder_pattern_status_load($name) {
+  $statuses = patternbuilder_pattern_statuses();
+  return isset($statuses[$name]) ? $statuses[$name] : NULL;
+}
+
+/**
+ * Returns the human readable title of any or all pattern statuses.
+ *
+ * @param string $name
+ *   Optional parameter specifying the name of the pattern status whose title
+ *   to return.
+ *
+ * @return array|null
+ *   Either an array of all pattern status titles keyed by the name or a
+ *   string containing the human readable title for the specified status. If a
+ *   status is specified that does not exist, this function returns NULL.
+ */
+function patternbuilder_pattern_status_get_label($name = NULL) {
+  $statuses = patternbuilder_pattern_statuses();
+
+  // Return a status title if specified and it exists.
+  if (!empty($name)) {
+    return isset($statuses[$name]['label']) ? t($statuses[$name]['label']) : NULL;
+  }
+
+  // Otherwise turn the array values into the status title only.
+  foreach ($statuses as $key => $status) {
+    $statuses[$key] = t($status['label']);
+  }
+
+  return $statuses;
+}
+
+/**
+ * Returns status labels for use in option lists.
+ *
+ * @return array
+ *   An array of sanitize pattern status labels keyed by machine name.
+ */
+function patternbuilder_pattern_status_options_list() {
+  $options = array();
+  foreach (patternbuilder_pattern_statuses() as $name => $status) {
+    $options[$name] = check_plain(t($status['label']));
+  }
+
+  return $options;
+}
+
+/**
+ * Determine the default pattern status.
+ *
+ * @return array
+ *   The status info array for the default status.
+ */
+function patternbuilder_pattern_status_default() {
+  $default_name = variable_get('patternbuilder_pattern_status_default', NULL);
+  if (isset($default_name) && ($default = patternbuilder_pattern_status_load($default_name))) {
+    return $default;
+  }
+
+  $statuses = patternbuilder_pattern_statuses();
+  return $statuses ? reset($statuses) : NULL;
+}
+
+/**
+ * Returns custom field instance settings for patternbuilder.
+ *
+ * @param array $instance
+ *   An array of field instance info.
+ * @param bool $only_stored
+ *   TRUE to only return stored values with no defaults or processing.
+ *
+ * @return array
+ *   An array of patternbuilder instance settings.
+ */
+function _patternbuilder_field_instance_settings(array $instance, $only_stored = FALSE) {
+  $defaults = array(
+    'hidden' => FALSE,
+    'readonly' => FALSE,
+    'property_name' => NULL,
+    'parent_property_names' => NULL,
+    'property_map' => NULL,
+    'real_property_name' => NULL,
+    'parent_property_names_array' => array(),
+    'property_map_array' => array(),
+    'grid_format' => FALSE,
+    'grid_columns' => NULL,
+  );
+
+  $settings = array();
+  if (!empty($instance['settings']['patternbuilder'])) {
+    $settings = $instance['settings']['patternbuilder'];
+    if (!$only_stored) {
+      $settings += $defaults;
+    }
+  }
+  elseif (!$only_stored) {
+    $settings = $defaults;
+  }
+
+  // Set property_name based on field name if empty.
+  if (!$only_stored && empty($settings['property_name']) && isset($instance['field_name'])) {
+    $parts = explode('_', $instance['field_name']);
+    if ($parts) {
+      $settings['property_name'] = array_pop($parts);
+    }
+  }
+
+  // Resolve real property name.
+  if (isset($settings['property_name'])) {
+    $settings['real_property_name'] = patternbuilder_get_property_real_name($settings['property_name']);
+  }
+
+  // Resolve parents.
+  if (!empty($settings['parent_property_names'])) {
+    $settings['parent_property_names_array'] = explode(PATTERNBUILDER_PROPERTY_DELIMITER, $settings['parent_property_names']);
+  }
+
+  // Property map.
+  if (!empty($settings['property_map'])) {
+    $settings['property_map_array'] = patternbuilder_parse_field_property_map($settings['property_map']);
+  }
+
+  return $settings;
+}
+
+/**
+ * Extracts the real name for a property name.
+ *
+ * @param string $name
+ *   The property name.
+ *
+ * @return string
+ *   The real property name.
+ */
+function patternbuilder_get_property_real_name($name) {
+  if (isset($name) && strpos($name, PATTERNBUILDER_PROPERTY_DELIMITER) !== FALSE) {
+    $chain = explode(PATTERNBUILDER_PROPERTY_DELIMITER, $name);
+    // The real name is the last part.
+    return array_pop($chain);
+  }
+
+  return $name;
+}
+
+/**
+ * Determine if the property is a tuple item.
+ *
+ * Tuple item properties are generated names which are not defined in the
+ * schema.
+ *
+ * @param string $property_name
+ *   The raw property name.
+ *
+ * @return bool
+ *   TRUE if the property is a tuple item.
+ */
+function patternbuilder_property_is_tuple_item($property_name) {
+  return strpos($property_name, PATTERNBUILDER_PROPERTY_PREFIX_TUPLE_ITEM . PATTERNBUILDER_PROPERTY_DELIMITER) === 0;
+}
+
+/**
+ * Parses a property map string to an array.
+ *
+ * @param string $map_string
+ *   The property map combined string.
+ *
+ * @return array
+ *   The property map parsed array.
+ */
+function patternbuilder_parse_field_property_map($map_string) {
+  $map = array();
+  $items = explode(PATTERNBUILDER_PROPERTY_MAP_ITEM_DELIMITER, $map_string);
+  if ($items) {
+    foreach ($items as $item) {
+      list($key, $value) = explode(PATTERNBUILDER_PROPERTY_MAP_VALUE_DELIMITER, $item);
+      if (isset($key) && isset($value)) {
+        $map[trim($key)] = trim($value);
+      }
+    }
+  }
+
+  return $map;
+}
+
+/**
+ * Creates a property map string from a map array.
+ *
+ * @param array $map
+ *   The property map array.
+ *
+ * @return array
+ *   The property map parsed array.
+ */
+function patternbuilder_join_field_property_map(array $map) {
+  $items = array();
+  foreach ($map as $key => $value) {
+    $items[] = trim($key) . PATTERNBUILDER_PROPERTY_MAP_VALUE_DELIMITER . trim($value);
+  }
+
+  return $items ? implode(PATTERNBUILDER_PROPERTY_MAP_ITEM_DELIMITER, $items) : '';
+}
+
+/**
+ * Determines if a field instance has patternbuilder settings.
+ *
+ * @param array $instance
+ *   An array of field instance info.
+ *
+ * @return bool
+ *   TRUE if the field instance has patternbuilder settings.
+ */
+function _patternbuilder_field_instance_has_settings(array $instance) {
+  return isset($instance['settings']['patternbuilder']) ||
+     ($instance['entity_type'] === 'paragraphs_item' &&
+      patternbuilder_get_bundle_component($instance['bundle']));
+}
+
+/**
+ * Returns all field instances that are mapped to a property.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param string $bundle_name
+ *   The entity bundle name.
+ *
+ * @return array
+ *   An array of field instances keyed by field name.
+ */
+function _patternbuilder_field_info_instances($entity_type, $bundle_name) {
+  $property_instances = array();
+  $instances = field_info_instances($entity_type, $bundle_name);
+
+  foreach ($instances as $field_name => $instance) {
+    $settings = _patternbuilder_field_instance_settings($instance, TRUE);
+    if ($settings && isset($settings['real_property_name'])) {
+      // Set resolved values on instance array to reduce calls to resolved.
+      $instance['settings']['patternbuilder'] = $settings;
+      $property_instances[$field_name] = $instance;
+    }
+  }
+
+  return $property_instances;
+}
+
+/**
+ * Finds the field instance for given property in a given component.
+ *
+ * Only a single bundle level is supported. This does not attempt to chain
+ * into fields that are field collections or paragraphs.
+ *
+ * @param string $component_machine_name
+ *   The machine name of the component schema.
+ * @param string|array $property_names
+ *   The property name or an array of property names representing the
+ *   hierarchical property structure with the last item being the desired
+ *   property name.
+ *
+ * @return array|null
+ *   The field instance info array if found.
+ */
+function patternbuilder_field_info_property_instance($component_machine_name, $property_names) {
+  if (is_string($property_names)) {
+    $property_names = array($property_names);
+  }
+  elseif (!is_array($property_names)) {
+    return NULL;
+  }
+
+  $component = patternbuilder_components_load($component_machine_name);
+  if (empty($component->bundle_name)) {
+    return NULL;
+  }
+
+  $entity_type = 'paragraphs_item';
+  $bundle_name = $component->bundle_name;
+  $instances = _patternbuilder_field_info_instances($entity_type, $bundle_name);
+  if (empty($instances)) {
+    return NULL;
+  }
+
+  // Note: only a single bundle level is supported. This does not attempt to
+  // chain into fields that are field collections or paragraphs.
+  $property_name = array_pop($property_names);
+  $parent_names = $property_names ? implode(PATTERNBUILDER_PROPERTY_DELIMITER, $property_names) : '';
+  foreach ($instances as $field_name => $instance) {
+    $settings = _patternbuilder_field_instance_settings($instance, TRUE);
+    if ($settings['real_property_name'] == $property_name) {
+      if (!$parent_names || $parent_names == $settings['parent_property_names']) {
+        return $instance;
+      }
+    }
+  }
+}
+
+/**
+ * Determines if an entity is considered to be a tuple.
+ *
+ * If there is at least 1 non-tuple item property field then none are returned.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param object $entity
+ *   The entity object.
+ *
+ * @return bool
+ *   TRUE if the entity is a tuple.
+ */
+function _patternbuilder_entity_is_tuple($entity_type, $entity) {
+  list($entity_id, $entity_revision_id, $entity_bundle) = entity_extract_ids($entity_type, $entity);
+  return isset($entity_bundle) && _patternbuilder_field_info_instance_tuple_items($entity_type, $entity_bundle);
+}
+
+/**
+ * Returns all field instances that are mapped to a tuple item property.
+ *
+ * If there is at least 1 non-tuple item property field then none are returned.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param string $bundle_name
+ *   The entity bundle name.
+ *
+ * @return array
+ *   An array of tuple item field instances keyed by field names.
+ */
+function _patternbuilder_field_info_instance_tuple_items($entity_type, $bundle_name) {
+  $filtered_instances = array();
+  $instances = field_info_instances($entity_type, $bundle_name);
+
+  foreach ($instances as $field_name => $instance) {
+    if (isset($instance['settings']['patternbuilder']['property_name'])) {
+      $raw_property_name = $instance['settings']['patternbuilder']['property_name'];
+
+      // Exit if there is at least 1 non-tuple item.
+      if (!patternbuilder_property_is_tuple_item($raw_property_name)) {
+        return array();
+      }
+
+      $field_info = field_info_field($field_name);
+
+      // Tuple items must be an entity to store the schema name to load.
+      if ($field_info['type'] != 'field_collection' && $field_info['type'] != 'paragraphs') {
+        return array();
+      }
+
+      $filtered_instances[$field_name] = $instance;
+    }
+  }
+
+  return $filtered_instances;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Implemented for field_ui_field_edit_form.
+ */
+function patternbuilder_form_field_ui_field_edit_form_alter(&$form, &$form_state) {
+  $instance = $form['#instance'];
+
+  // If pb settings imported OR is a pattern paragraphs item.
+  if (_patternbuilder_field_instance_has_settings($instance)) {
+    // Fieldset for Pattern Builder settings on this field instance.
+    $form['instance']['settings']['patternbuilder'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Pattern Builder'),
+      '#collapsible' => FALSE,
+      '#collapsed' => FALSE,
+    );
+
+    $settings = _patternbuilder_field_instance_settings($instance);
+
+    $form['instance']['settings']['patternbuilder']['property_name'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Property name'),
+      '#description' => t('The machine name of the pattern schema property that corresponds to this field.'),
+      '#default_value' => $settings['property_name'],
+    );
+
+    $form['instance']['settings']['patternbuilder']['parent_property_names'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Parent property names'),
+      '#description' => t('The parent machine names of the pattern schema property that corresponds to this field. Parents are separated by "@delim". Example: "group1@delimgroup2"', array(
+        '@delim' => PATTERNBUILDER_PROPERTY_DELIMITER,
+      )),
+      '#default_value' => $settings['parent_property_names'],
+    );
+
+    $form['instance']['settings']['patternbuilder']['property_map'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Property map'),
+      '#description' => t('The mapping of Drupal field properties to schema properties. Example: "@map"', array(
+        '@map' => patternbuilder_join_field_property_map(array(
+          'url' => 'src',
+          'title' => 'text',
+        )),
+      )),
+      '#default_value' => $settings['property_map'],
+    );
+
+    $form['instance']['settings']['patternbuilder']['hidden'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Hidden on the edit form'),
+      '#default_value' => $settings['hidden'],
+    );
+
+    $form['instance']['settings']['patternbuilder']['readonly'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Read-only on the edit form'),
+      '#default_value' => $settings['readonly'],
+    );
+
+    $form['instance']['settings']['patternbuilder']['grid_format'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Grid layout on the edit form'),
+      '#default_value' => $settings['grid_format'],
+    );
+    $form['instance']['settings']['patternbuilder']['grid_columns'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Grid columns on the edit form (1 - 12)'),
+      '#description' => t('The grid columns for a child property with a parent property that has a grid format.'),
+      '#default_value' => $settings['grid_columns'],
+      '#size' => 10,
+      '#element_validate' => array('element_validate_integer_positive'),
+    );
+  }
+}
+
+/**
+ * Returns global settings for the grid layout on an edit form.
+ *
+ * @return array
+ *   The settings keyed by shorten names,
+ */
+function patternbuilder_grid_layout_global_settings() {
+  return array(
+    'row_class' => variable_get('patternbuilder_grid_row_class', 'row'),
+    'col_class_prefix' => variable_get('patternbuilder_grid_col_class_prefix', 'grid-columns-'),
+  );
+}
+
+/**
+ * Implements hook_field_attach_form().
+ */
+function patternbuilder_field_attach_form($entity_type, $entity, &$form, &$form_state, $langcode) {
+  // Limit scope to only patternbuilder maintained entity types.
+  if ($entity_type !== 'paragraphs_item' && $entity_type !== 'field_collection_item') {
+    return;
+  }
+
+  list($entity_id, $entity_vid, $bundle_name) = entity_extract_ids($entity_type, $entity);
+
+  // Exit if no bundle.
+  if (empty($bundle_name)) {
+    return;
+  }
+
+  // Alter the field elements.
+  $field_instances = field_info_instances($entity_type, $bundle_name);
+  foreach ($field_instances as $field_name => $field_instance) {
+    if (!isset($form[$field_name]) || !isset($form[$field_name]['#language'])) {
+      continue;
+    }
+
+    $field_language = $form[$field_name]['#language'];
+    if (!isset($form[$field_name][$field_language])) {
+      continue;
+    }
+
+    $instance_settings = _patternbuilder_field_instance_settings($field_instance);
+    if (empty($instance_settings)) {
+      continue;
+    }
+
+    // Reference elements.
+    $elements = &$form[$field_name][$field_language];
+    $field_info = field_info_field($field_name);
+
+    // Determine the field flags.
+    $is_required = isset($field_instance['required']) && !empty($field_instance['required']);
+    $is_readonly = !empty($instance_settings['readonly']);
+    $is_hidden = !empty($instance_settings['hidden']);
+
+    // Hide or disable fields only if they are not required or have values.
+    // Note: This is neeed so that a required field is not disabled or
+    // hidden with an empty value causing form validations errors that cannot
+    // be fixed by the user.
+    if ($is_readonly || $is_hidden) {
+      $can_hide = !$is_required;
+      if (!$can_hide) {
+
+        $on_value = isset($elements['#on_value']) ? $elements['#on_value'] : NULL;
+        $value_key = NULL;
+        if (isset($elements['#value_key'])) {
+          $value_key = $elements['#value_key'];
+        }
+        elseif (!empty($elements[0]['#columns'])) {
+          $value_key = reset($elements[0]['#columns']);
+        }
+
+        // Inspect the form array if there are no values on the entity.
+        if (isset($elements['#default_value'])) {
+          if ((isset($on_value) && $elements['#default_value'] == $on_value) || $elements['#default_value'] !== '') {
+            $can_hide = TRUE;
+          }
+        }
+        elseif (isset($elements[0])) {
+          foreach (element_children($elements) as $delta) {
+            if (is_numeric($delta)) {
+              $value_element = isset($elements[$delta][$value_key]) ? $elements[$delta][$value_key] : $elements[$delta];
+              if (isset($value_element['#default_value'])) {
+                if ((isset($on_value) && $value_element['#default_value'] == $on_value) || $value_element['#default_value'] !== '') {
+                  $can_hide = TRUE;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if ($can_hide) {
+        // Read-only properties.
+        if ($is_readonly) {
+          $form[$field_name]['#disabled'] = TRUE;
+        }
+
+        // Hidden properties.
+        if ($is_hidden) {
+          $form[$field_name]['#access'] = FALSE;
+        }
+      }
+    }
+
+    // Grid layout.
+    $grid_settings = patternbuilder_grid_layout_global_settings();
+    if (!empty($instance_settings['grid_format']) && !empty($grid_settings['row_class'])) {
+      if ($field_info['cardinality'] == 1) {
+        $form[$field_name]['#attributes']['class'][] = $grid_settings['row_class'];
+      }
+      else {
+        foreach (element_children($elements) as $delta) {
+          if (is_numeric($delta)) {
+            $elements[$delta]['#attributes']['class'][] = $grid_settings['row_class'];
+          }
+        }
+      }
+    }
+
+    if (!empty($instance_settings['grid_columns']) && !empty($grid_settings['col_class_prefix'])) {
+      $form[$field_name]['#attributes']['class'][] = $grid_settings['col_class_prefix'] . intval(trim($instance_settings['grid_columns']));
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function patternbuilder_field_widget_info() {
+  return array(
+    'patternbuilder_paragraphs_embed' => array(
+      'label' => t('Embedded Patterns'),
+      'field types' => array('paragraphs'),
+      'settings' => array(
+        'allowed_pattern_types' => array(),
+        'allow_non_patterns' => FALSE,
+        'alpha_sort' => TRUE,
+      ),
+      'behaviors' => array(
+        'multiple values' => FIELD_BEHAVIOR_CUSTOM,
+        'default value' => FIELD_BEHAVIOR_NONE,
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_settings_form().
+ */
+function patternbuilder_field_widget_settings_form($field, $instance) {
+  $widget = $instance['widget'];
+  $settings = $widget['settings'] + field_info_widget_settings($widget['type']);
+  $form = NULL;
+
+  if ($widget['type'] == 'patternbuilder_paragraphs_embed') {
+    $form = array();
+    $pattern_type_options = patternbuilder_pattern_types_options_list();
+
+    // Limit the list to patterns mapped to bundles.
+    $pattern_type_bundles = patternbuilder_components_get_pattern_type_bundles();
+    $pattern_type_options = array_intersect_key($pattern_type_options, $pattern_type_bundles);
+
+    $form['allowed_pattern_types'] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Allowed Pattern Types'),
+      '#description' => t('If no pattern type is selected, then all pattern types will be available.'),
+      '#default_value' => $settings['allowed_pattern_types'],
+      '#options' => $pattern_type_options,
+    );
+
+    $form['allow_non_patterns'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Allow Non-Pattern paragraph bundles'),
+      '#description' => t('If enabled, then explicitly selected non-pattern paragraph bundles will be available in the pattern selection. The non-pattern bundles ca be selected in the "Allowed Paragraph bundles".'),
+      '#default_value' => $settings['allow_non_patterns'],
+    );
+
+    $form['alpha_sort'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Sort bundles alphabetically'),
+      '#description' => t('If enabled, then the bundles are sorted alphabetically by bundle label regardless of any manual ordering in the "Allowed Paragraph bundles".  The pattern bundles are sorted first followed by the non-pattern bundles.'),
+      '#default_value' => $settings['alpha_sort'],
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function patternbuilder_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  $elements = array();
+
+  if ($instance['widget']['type'] == 'patternbuilder_paragraphs_embed') {
+    $elements = patternbuilder_paragraphs_field_multiple_value_form($field, $instance, $langcode, $items, $form, $form_state, $delta, $element);
+  }
+
+  return $elements;
+}
+
+/**
+ * Implements hook_field_widget_form_build().
+ *
+ * The function paragraphs_field_multiple_value_form() calls this function
+ * for the widget module.
+ *
+ * @see paragraphs_field_multiple_value_form()
+ * @see paragraphs_field_widget_form_build()
+ */
+function patternbuilder_field_widget_form_build(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  module_load_include('inc', 'paragraphs', 'paragraphs.field_widget');
+  $element = paragraphs_field_widget_form_build($form, $form_state, $field, $instance, $langcode, $items, $delta, $element);
+  return $element;
+}
+
+/**
+ * Special handling to create elements for multiple paragraph pattern embeds.
+ *
+ * @see paragraphs_field_multiple_value_form()
+ */
+function patternbuilder_paragraphs_field_multiple_value_form($field, $instance, $langcode, $items, &$form, &$form_state, $delta, $element) {
+  $widget = $instance['widget'];
+  $settings = $widget['settings'] + field_info_widget_settings($widget['type']);
+
+  // Get some pattern info.
+  $components = patternbuilder_components_load();
+  $bundle_components = patternbuilder_get_bundle_component_map();
+  $available_pattern_type_bundles = patternbuilder_components_get_pattern_type_bundles();
+  $invisible_statuses = patternbuilder_pattern_statuses(array(
+    'visible' => FALSE,
+  ));
+  $non_creatable_statuses = patternbuilder_pattern_statuses(array(
+    'creatable' => FALSE,
+  ));
+
+  // Set allowed bundles to the allowed patterns.
+  $available_bundles = paragraphs_bundle_load();
+  $bundles_sorted = FALSE;
+
+  // Alpha sort the available bundle names. This will be used to set the final
+  // order for patterns and non-patterns.
+  if (!empty($settings['alpha_sort'])) {
+    $bundle_labels = array();
+    foreach ($available_bundles as $bundle_name => $bundle_info) {
+      $bundle_labels[$bundle_name] = isset($bundle_info->name) ? $bundle_info->name : $bundle_name;
+    }
+
+    uasort($bundle_labels, 'strnatcasecmp');
+    $available_bundle_names = array_keys($bundle_labels);
+    $bundles_sorted = TRUE;
+  }
+  else {
+    $available_bundle_names = array_keys($available_bundles);
+  }
+
+  $available_bundle_names = array_combine($available_bundle_names, $available_bundle_names);
+
+  // Build instance allowed bundles per the field instance settings.
+  $instance_bundles_allowed = array();
+  if (!empty($instance['settings']['allowed_bundles'])) {
+    foreach ($instance['settings']['allowed_bundles'] as $bundle_setting_key => $bundle_setting_value) {
+      if ($bundle_setting_key === $bundle_setting_value && isset($available_bundles[$bundle_setting_key])) {
+        $instance_bundles_allowed[$bundle_setting_key] = $bundle_setting_key;
+      }
+    }
+  }
+
+  // Split bundles allowed into patterns and non-patterns.
+  $instance_patterns_allowed = array();
+  $instance_non_patterns_allowed = array();
+  if (!empty($instance_bundles_allowed)) {
+    $instance_patterns_allowed = array_intersect_key($instance_bundles_allowed, $bundle_components);
+
+    // Set allowed non-patterns if widget setting is enabled.
+    if (!empty($settings['allow_non_patterns'])) {
+      $instance_non_patterns_allowed = array_diff_key($instance_bundles_allowed, $bundle_components);
+    }
+  }
+
+  // Pattern type allowed bundles.
+  $pattern_types_allowed = array();
+  if (isset($settings['allowed_pattern_types'])) {
+    $pattern_types_allowed = array_keys(array_filter($settings['allowed_pattern_types']));
+  }
+
+  if (empty($pattern_types_allowed)) {
+    $pattern_types_allowed = array_keys($available_pattern_type_bundles);
+  }
+
+  // Build allowed patterns based on the pattern types.
+  $patterns_allowed_by_type = array();
+  foreach ($pattern_types_allowed as $allowed_pattern_type) {
+    if (isset($available_pattern_type_bundles[$allowed_pattern_type])) {
+      $patterns_allowed_by_type += $available_pattern_type_bundles[$allowed_pattern_type];
+    }
+  }
+
+  // Set to all patterns if no pattern is explicitly selected.
+  $has_unlimited_patterns = empty($instance_patterns_allowed) && !empty($patterns_allowed_by_type);
+  if ($has_unlimited_patterns) {
+    $instance_patterns_allowed = $patterns_allowed_by_type;
+  }
+
+  // Build allowed bundles.
+  $patterns_allowed = array_intersect($patterns_allowed_by_type, $instance_patterns_allowed);
+
+  // Remove non-visible and non-creatable patterns.
+  if ($has_unlimited_patterns && $invisible_statuses) {
+    foreach (array_keys($patterns_allowed) as $machine_name) {
+      if (isset($components[$machine_name]->status) && isset($invisible_statuses[$components[$machine_name]->status])) {
+        unset($patterns_allowed[$machine_name]);
+      }
+    }
+  }
+
+  // Remove non-creatable patterns.
+  foreach (array_keys($patterns_allowed) as $machine_name) {
+    if (isset($components[$machine_name]->status) && isset($non_creatable_statuses[$components[$machine_name]->status])) {
+      unset($patterns_allowed[$machine_name]);
+    }
+  }
+
+  // Build the allowed bundles.
+  $bundles_allowed = array_intersect($available_bundle_names, array_values($patterns_allowed));
+  if (!empty($instance_non_patterns_allowed)) {
+    $non_patterns_sorted = array_intersect($available_bundle_names, array_values($instance_non_patterns_allowed));
+    $bundles_allowed = array_merge($bundles_allowed, $non_patterns_sorted);
+  }
+
+  // Ensure this is a unique list of available bundles.
+  $bundles_allowed = array_unique($bundles_allowed);
+
+  // Override instance settings for the paragraphs widget to build correctly.
+  // The allowed bundles is keyed by bundle name with values of bundle name.
+  $instance['settings']['allowed_bundles'] = array_combine($bundles_allowed, $bundles_allowed);
+
+  // Override the bundle weights if the bundles were sorted.
+  if ($bundles_sorted) {
+    $instance['settings']['bundle_weights'] = array_combine($bundles_allowed, range(0, count($bundles_allowed) - 1, 1));
+  }
+
+  // Build form elements.
+  module_load_include('inc', 'paragraphs', 'paragraphs.field_widget');
+  $elements = paragraphs_field_multiple_value_form($field, $instance, $langcode, $items, $form, $form_state, $delta, $element);
+
+  return $elements;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function patternbuilder_theme() {
+  $module_path = drupal_get_path('module', 'patternbuilder');
+  return array(
+    'patternbuilder_items' => array(
+      'render element' => 'element',
+      'template' => 'patternbuilder-items',
+      'path' => $module_path . '/theme',
+      'file' => 'theme.inc',
+    ),
+    'patternbuilder_item' => array(
+      'render element' => 'elements',
+      'template' => 'patternbuilder-item',
+      'path' => $module_path . '/theme',
+      'file' => 'theme.inc',
+    ),
+    'patternbuilder_pattern_statuses' => array(
+      'variables' => array('statuses' => NULL),
+      'path' => $module_path . '/theme',
+      'file' => 'theme.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_formatter_info().
+ */
+function patternbuilder_field_formatter_info() {
+  return array(
+    'patternbuilder_view' => array(
+      'label' => t('Patternbuilder rendered items'),
+      'field types' => array('paragraphs'),
+      'settings' => array(
+        'view_mode' => 'full',
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_formatter_settings_form().
+ */
+function patternbuilder_field_formatter_settings_form($field, $instance, $view_mode, $form, &$form_state) {
+  $display = $instance['display'][$view_mode];
+  $settings = $display['settings'];
+  $elements = array();
+
+  if ($display['type'] == 'patternbuilder_view') {
+    $entity_info = entity_get_info('paragraphs_item');
+    $view_mode_options = array();
+    foreach ($entity_info['view modes'] as $view_mode => $view_mode_info) {
+      $view_mode_options[$view_mode] = isset($view_mode_info['label']) ? $view_mode_info['label'] : $view_mode;
+      $view_mode_options[$view_mode] = check_plain($view_mode_options[$view_mode]);
+    }
+
+    $elements['view_mode'] = array(
+      '#type' => 'select',
+      '#title' => t('View mode'),
+      '#options' => $view_mode_options,
+      '#default_value' => $settings['view_mode'],
+      '#description' => t('The selected view mode is used to render the paragraph item fields.'),
+    );
+  }
+
+  return $elements;
+}
+
+/**
+ * Implements hook_field_formatter_settings_summary().
+ */
+function patternbuilder_field_formatter_settings_summary($field, $instance, $view_mode) {
+  $display = $instance['display'][$view_mode];
+  $settings = $display['settings'];
+  $output = array();
+
+  if ($display['type'] == 'patternbuilder_view') {
+    $entity_info = entity_get_info('paragraphs_item');
+    if (isset($entity_info['view modes'][$settings['view_mode']])) {
+      $view_mode_label = $settings['view_mode'];
+      if (!empty($entity_info['view modes'][$settings['view_mode']]['label'])) {
+        $view_mode_label = $entity_info['view modes'][$settings['view_mode']]['label'];
+      }
+
+      $output[] = t('View mode: @mode', array(
+        '@mode' => $view_mode_label,
+      ));
+    }
+    else {
+      $output[] = ' ';
+    }
+  }
+
+  return implode('<br />', $output);
+}
+
+/**
+ * Implements hook_field_formatter_prepare_view().
+ */
+function patternbuilder_field_formatter_prepare_view($entity_type, $entities, $field, $instances, $langcode, &$items, $displays) {
+  // @todo: Preload Twig renderers similar to a node reference field formatter?
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ */
+function patternbuilder_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+  $element = array();
+  $settings = $display['settings'] + field_info_formatter_settings($display['type']);
+
+  if (empty($items)) {
+    return $element;
+  }
+
+  switch ($display['type']) {
+    case 'patternbuilder_view':
+      // Note: Recursion check similar to the entity reference field is not
+      // needed since this formatter is limited to the "paragraphs" field type
+      // which does not support referencing existing paragraph entities.
+      $paragraph_info = entity_get_info('paragraphs_item');
+
+      // Set the items theme.
+      $element['#theme_wrappers'] = array();
+      $element['#theme'] = array('patternbuilder_items');
+
+      // Get the view mode.
+      $display_view_mode = 'full';
+      if (!empty($settings['view_mode']) && isset($paragraph_info['view modes'][$settings['view_mode']])) {
+        $display_view_mode = $settings['view_mode'];
+      }
+
+      // Process items.
+      foreach ($items as $delta => $item) {
+        if ($paragraph = paragraphs_field_get_entity($item)) {
+          $paragraph->setHostEntity($entity_type, $entity, $langcode);
+          if (entity_access('view', 'paragraphs_item', $paragraph)) {
+            $element[$delta] = array(
+              '#theme' => 'patternbuilder_item',
+              '#entity_type' => 'paragraphs_item',
+              '#entity' => $paragraph,
+              '#language' => $langcode,
+              '#view_mode' => $display_view_mode,
+            );
+          }
+        }
+      }
+
+      break;
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for node_type_form().
+ */
+function patternbuilder_form_node_type_form_alter(&$form, &$form_state) {
+  if (isset($form['#node_type']->type)) {
+    $type = $form['#node_type'];
+
+    $form['patternbuilder'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Pattern Builder'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#group' => 'additional_settings',
+    );
+
+    // The node type is automatically appended to the name.
+    $form['patternbuilder']['patternbuilder_wrapped_schema_bundle_node'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Use this node type as a wrapped pattern'),
+      '#description' => t('A wrapped pattern is a single paragraph field on a node type. If enabled, then only the single paragraph field will be rendered when a node of this type is referenced in a larger pattern.  This provides a way to control publishing and moderation of sub-patterns.'),
+      '#default_value' => variable_get('patternbuilder_wrapped_schema_bundle_node_' . $type->type, FALSE),
+    );
+  }
+}
+
+/**
+ * Determine if an entity bundle is a wrapped schema.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param string $entity_bundle
+ *   The entity bundle.
+ *
+ * @return bool
+ *   TRUE if this bundle enabled to be a wrapped schema.
+ */
+function patternbuilder_entity_bundle_is_wrapped_schema($entity_type, $entity_bundle) {
+  return variable_get('patternbuilder_wrapped_schema_bundle_' . $entity_type . '_' . $entity_bundle, FALSE);
+}
+
+/**
+ * Get the wrapped schema field instance for an entity bundle.
+ *
+ * A wrapped schema field is defined as 1 and only 1 field matching the
+ * following on the provided bundle:
+ * - Field type = "paragraphs".
+ * - Field cardinality = 1.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param string $entity_bundle
+ *   The entity bundle.
+ *
+ * @return array|null
+ *   The paragraph field instance array if found, else NULL.
+ */
+function patternbuilder_wrapped_schema_field_instance($entity_type, $entity_bundle) {
+  if (patternbuilder_entity_bundle_is_wrapped_schema($entity_type, $entity_bundle)) {
+    $schema_instances = array();
+    $field_instances = field_info_instances($entity_type, $entity_bundle);
+    foreach ($field_instances as $field_name => $field_instance) {
+      $field_info = field_info_field($field_name);
+      if (isset($field_info['type']) && $field_info['type'] == 'paragraphs' && $field_info['cardinality'] == 1) {
+        $schema_instances[$field_name] = $field_instance;
+      }
+    }
+
+    if (count($schema_instances) == 1) {
+      return reset($schema_instances);
+    }
+  }
+}
+
+/**
+ * Get the wrapped schema field instance for a given entity.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param object $entity
+ *   The entity object.
+ *
+ * @return array|null
+ *   The paragraph field instance array if found, else NULL.
+ */
+function patternbuilder_wrapped_schema_field_instance_by_entity($entity_type, $entity) {
+  list($entity_id, $entity_revision_id, $entity_bundle) = @entity_extract_ids($entity_type, $entity);
+  if ($entity_bundle) {
+    $schema_instance = patternbuilder_wrapped_schema_field_instance($entity_type, $entity_bundle);
+    if (!empty($schema_instance['field_name'])) {
+      return $schema_instance;
+    }
+  }
+}
